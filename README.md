@@ -58,14 +58,9 @@ process-start payloads, a header PID that differs from the new process PID, Unic
 image names, and missing/truncated payloads. Error handler tests verify suppression,
 cause reporting, retained native codes, distinct NTSTATUS descriptions for statuses
 that share a Win32 mapping, native catalog fallback, and last-error preservation.
-Process telemetry tests collect all four native helper results from the current
-process through `NtOpenProcess`, verify that owned records remain usable after
-the handle closes and can be shared across threads, and preserve native failures
-when query access is missing. Both full and limited query access are exercised.
-PE address tests compare the current x64 image with `GetModuleHandleW`, exercise
-pointer widths and access failures, and inspect a 32-bit Windows PowerShell child
-that independently reports its image base. The child is launched without a window
-and is stopped after the test.
+Generic and PE telemetry components compile in test builds but currently have
+no automated tests in their folders. Their READMEs include current-process
+examples for complete metadata collection, image headers, and section metadata.
 Dynamic import tests verify the resolved native read signature and preserve the
 Win32 failure returned for a missing export.
 These tests do not require administrator permissions. The standalone process-handle
@@ -75,6 +70,9 @@ Live session capture requires the ETW permissions described above.
 Source formatting follows the Allman-style braces required by `AGENTS.md`.
 
 ## ETW process-start monitoring
+
+See the [ETW README](src/ETW/README.md) for the monitoring API, session lifecycle,
+event decoding, shutdown behavior, and verification.
 
 All monitoring logic is in `src/ETW/mod.rs`; `src/main.rs` starts it and returns a
 failure exit code when startup fails. The module creates the `RosaryEDR-ProcessStart` real-time session,
@@ -104,6 +102,9 @@ The implementation uses Microsoft's documented
 and [TDH property decoding](https://learn.microsoft.com/en-us/windows/win32/api/tdh/nf-tdh-tdhgetproperty).
 
 ## Error handling
+
+See the [ErrorHandle README](src/ErrorHandle/README.md) for handler selection,
+error propagation, native code preservation, description lookup, and examples.
 
 `src/ErrorHandle/mod.rs` provides shared native error handlers. Every handler takes
 a `print_to_console: bool` parameter: `true` writes to stderr, and `false` produces
@@ -175,6 +176,8 @@ console write failure without replacing the original error being reported.
 It is included only in test builds for verification and has not been wired into
 the ETW event flow. The folder also contains `Telementry/Generic/helpers.rs` for
 native metadata queries and `Telementry/Generic/data.rs` for owned data collection;
+`Telementry/Generic/handle_objects.rs` owns handle-type snapshots and counting.
+`Telementry/Generic/window_objects.rs` owns process-window enumeration and visibility counts.
 `Telementry/PE/helpers.rs` provides main executable image-address discovery.
 `imports.rs` centralizes additional dynamically resolved process/token APIs.
 The spelling `Telementry` is intentional.
@@ -216,7 +219,7 @@ and Rust's [OwnedHandle ownership model](https://doc.rust-lang.org/std/os/window
 fixed `NtReadVirtualMemory` export from the already-loaded `ntdll.dll` through
 `GetProcAddress` and casts it only to its matching typed native signature.
 `ProcessApis::nt_read_virtual_memory` is the resulting unsafe function pointer.
-The PE helper uses this table instead of a direct native declaration.
+PE and Generic parameter helpers use this table instead of a direct native declaration.
 
 `GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN)` keeps the module loaded for
 the calling process's lifetime. `OnceLock` caches either the complete API table
@@ -236,23 +239,32 @@ and [module lifetime contract](https://learn.microsoft.com/en-us/windows/win32/a
 
 ### Process telemetry
 
-See the [telemetry README](src/ProcessDirectives/Telementry/README.md) for helper
-purpose, field definitions, access requirements, and current-process usage examples.
+See the [Generic README](src/ProcessDirectives/Telementry/Generic/README.md) for
+the collection API, record fields, access requirements, and current-process examples.
+The [telemetry README](src/ProcessDirectives/Telementry/README.md) also covers PE
+inspection and the shared process API imports.
+See the [PE README](src/ProcessDirectives/Telementry/PE/README.md) for image-address
+discovery, header checks, section records, byte signatures, and examples.
 
-`src/ProcessDirectives/Telementry/Generic/helpers.rs` provides four independent queries.
+The Generic folder provides seven independent queries across `helpers.rs`,
+`handle_objects.rs`, and `window_objects.rs`.
 Each takes `BorrowedHandle<'_>` and `print_errors: bool`, returns an
-`std::io::Result`, and reports failures through the shared NTSTATUS error system.
+`std::io::Result`, and reports failures through `ErrorHandle`, retaining native
+NTSTATUS or Win32 error codes where provided by the API.
 The helpers borrow the handle without closing it or transferring ownership.
-They are compiled and exercised in test builds, alongside the process-handle
+They are compiled in test builds, alongside the process-handle
 component, and have not been wired into the runtime ETW event flow.
 
 `src/ProcessDirectives/Telementry/Generic/data.rs` is the generic telemetry entry
-point. Its `collect_process_data(handle, print_errors)` calls all four helpers and
-returns `io::Result<ProcessData>`. The owned record contains `ObjectData`,
-`ProcessBasicData`, `ProcessProtection`, and `Vec<String>` enabled privileges.
+point. Its `collect_process_data(handle, print_errors)` calls all seven metadata
+helpers and returns `io::Result<ProcessData>`. The owned record contains `ObjectData`,
+`ProcessBasicData`, `ProcessProtection`, `Vec<String>` enabled privileges, and a
+`handle_type_counts: BTreeMap<String, usize>` map, `current_directory: PathBuf`,
+`command_line: OsString`, and `window_objects: ProcessWindowData`. Complete collection requires
+`PROCESS_QUERY_INFORMATION | PROCESS_VM_READ`.
 Native-width identifiers and the PEB address are stored as `usize`; exit status,
 access rights, attributes, counts, and reserved object values are preserved.
-The record contains no handles or borrowed data and can be retained in collections
+The record contains no owned handles or borrowed data and can be retained in collections
 or shared across threads after the source handle closes. Collection stops at the
 first failed query, preserving its error without returning a partial record.
 
@@ -262,6 +274,9 @@ first failed query, preserving its error without returning a partial record.
 | `query_process_basic_information` | `NtQueryInformationProcess(ProcessBasicInformation)` | `PROCESS_BASIC_INFORMATION`: exit status, PEB address, affinity, base priority, PID, parent PID |
 | `query_process_protection` | `NtQueryInformationProcess(ProcessProtectionInformation)` | `ProcessProtection`: raw level byte and decoded protection type, audit flag, signer |
 | `query_enabled_process_privileges` | `NtOpenProcessToken(TOKEN_QUERY)` and `NtQueryInformationToken(TokenPrivileges)` | `Vec<String>` containing enabled privilege names |
+| `handle_objects::query_process_handle_type_counts` | `NtQueryInformationProcess(ProcessHandleInformation)` and `NtQueryObject(ObjectTypesInformation)` | `BTreeMap<String, usize>` counting owned handles by native type name |
+| `helpers::query_process_parameters` | Native/WoW64 PEB selection and bounded `NtReadVirtualMemory` reads | `ProcessParameters` containing an owned current directory and full command line |
+| `window_objects::query_process_windows` | `GetProcessId`, top-level/child/message-only window enumeration, PID filtering, and `IsWindowVisible` | `ProcessWindowData` containing a window list, total HWND count, and invisible count |
 
 The existing `windows-sys` structures supply the native object and process layouts.
 Object basic information's `HandleCount` counts open handles referring to that
@@ -270,6 +285,41 @@ Neither counts the handles owned by the target process. `GrantedAccess` is the
 access mask on the particular handle being queried. Object queries accept other
 object types too, so object information alone does not establish process identity.
 The reserved object fields are returned but are not interpreted.
+
+The `handle_objects::query_process_handle_type_counts(handle, print_errors)` helper
+returns counts of handles owned by the target process, grouped by native names
+such as `File`, `Process`, and `Event`. The owned map is sorted by name and omits
+types absent from the snapshot. It counts snapshot entries and resolves their
+type indices through the native catalog, without duplicating target handles.
+Use `PROCESS_QUERY_INFORMATION`; process memory-read and handle-duplication
+rights are not required. Invalid buffers or unresolved types return an error
+without partial counts. `collect_process_data` stores the returned map in
+`ProcessData::handle_type_counts`.
+
+`helpers::query_process_parameters` reads the selected native x64 or WoW64
+process-parameters block and returns the current directory as `PathBuf` and full
+command line as `OsString`. These become `ProcessData::current_directory` and
+`ProcessData::command_line`. UTF-16 is preserved without lossy conversion or
+argument splitting. Normalized parameter sizes, string lengths, pointer ranges,
+and exact read counts are checked. Both fields reflect target-controlled state
+at collection time; they do not prove the original startup directory or arguments.
+
+`window_objects::query_process_windows` returns `ProcessWindowData` with
+`windows: Vec<WindowData>`, `handle_count: usize`, and `invisible_count: usize`.
+Each entry retains a numeric `handle`, creating `thread_id`, and `is_visible`.
+The collector stores this in `ProcessData::window_objects`. Enumeration includes
+desktop-app top-level windows, descendants, and message-only windows on the
+collector's current desktop, filtered by creator PID and deduplicated by HWND.
+Other desktops and sessions are outside this query's scope. An empty match set
+returns zero counts.
+
+Invisible means `IsWindowVisible` returned false, including children of hidden
+parents; it does not measure whether a window is obscured or DWM-cloaked. The
+standalone helper needs only process query access, never duplicates or closes
+target handles, and retains HWNDs as opaque numbers that may later be reused.
+Window counts describe USER objects separately from kernel handle-type counts.
+See the [window guide](src/ProcessDirectives/Telementry/Generic/README.md#process-windows-and-visibility)
+and Microsoft's [visibility contract](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-iswindowvisible).
 
 Process basic and protection queries need process query access. Use
 `PROCESS_QUERY_LIMITED_INFORMATION` or `PROCESS_QUERY_INFORMATION` when opening
@@ -291,11 +341,11 @@ Default-enabled or previously-used flags alone do not establish current enabled
 state. It validates the variable-length native buffer, resolves LUID names with
 `LookupPrivilegeNameW`, and closes the owned token handle on every return path.
 An empty enabled set returns an empty list; lookup failures return `Err`.
-Use `PROCESS_QUERY_INFORMATION` for the documented native token-open contract;
-tests also verify limited query access on the current Windows system.
+Use `PROCESS_QUERY_INFORMATION` for the documented native token-open contract
+and complete collection, including the handle-type snapshot.
 
 The helpers validate returned buffer lengths and return `InvalidData` for
-unexpected layouts. Native failures retain their original NTSTATUS and mapped
+unexpected layouts. NTSTATUS failures retain their original status and mapped
 Win32 code. `print_errors = false` suppresses reporting while still returning
 `Err`. Successful queries return data without console output. Values are snapshots;
 counts and process state can change between calls.
@@ -453,8 +503,9 @@ The enabled features are `Wdk_Foundation`, `Wdk_Storage_FileSystem`, `Wdk_System
 `Win32_Foundation`, `Win32_Security`, `Win32_System_Console`,
 `Win32_System_Diagnostics_Debug`, `Win32_System_Diagnostics_Etw`,
 `Win32_System_Kernel`, `Win32_System_LibraryLoader`, `Win32_System_SystemInformation`,
-`Win32_System_Threading`, `Win32_System_Time`, and
-`Win32_System_WindowsProgramming`. The WDK namespaces provide the native API
+`Win32_System_Threading`, `Win32_System_Time`,
+`Win32_System_WindowsProgramming`, and `Win32_UI_WindowsAndMessaging`. The last
+feature supplies process-window enumeration and visibility APIs. The WDK namespaces provide the native API
 bindings used here, including token APIs in `Wdk_Storage_FileSystem`;
 `Win32_System_Kernel` enables the native PEB/process-information
 types. `Win32_System_SystemInformation` enables the native machine constants

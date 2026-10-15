@@ -45,6 +45,7 @@ pub fn query_process_sections(handle: BorrowedHandle<'_>, image_base_address: us
     };
 
     let section_count = file_header.NumberOfSections as usize;
+    
     let Some(table_length) = section_count.checked_mul(size_of::<IMAGE_SECTION_HEADER>()) else
     {
         let error = io::Error::new(io::ErrorKind::InvalidData, "The section table length overflows the size range.");
@@ -89,10 +90,12 @@ pub fn query_process_sections(handle: BorrowedHandle<'_>, image_base_address: us
         {
             std::ptr::read_unaligned(bytes.as_ptr().cast::<IMAGE_SECTION_HEADER>())
         };
+
         let virtual_size = unsafe
         {
             header.Misc.VirtualSize
         };
+
         let size = virtual_size.max(header.SizeOfRawData);
 
         if !header.VirtualAddress.is_multiple_of(optional_header.section_alignment)

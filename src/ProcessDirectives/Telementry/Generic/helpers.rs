@@ -1,15 +1,21 @@
 use crate::error_handle;
+use crate::process_imports::process_apis;
+use std::ffi::{c_void, OsString};
 use std::io;
 use std::mem::{offset_of, size_of, size_of_val};
+use std::os::windows::ffi::OsStringExt;
 use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
+use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use windows_sys::Wdk::Foundation::{NtQueryObject, ObjectBasicInformation};
 use windows_sys::Wdk::Storage::FileSystem::{NtOpenProcessToken, NtQueryInformationToken};
-use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation, ProcessProtectionInformation};
+use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation, ProcessProtectionInformation, ProcessWow64Information};
 use windows_sys::Win32::Foundation::{GetLastError, ERROR_INSUFFICIENT_BUFFER, STATUS_BUFFER_TOO_SMALL};
 use windows_sys::Win32::Security::{LookupPrivilegeNameW, TokenPrivileges, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED, SE_PRIVILEGE_REMOVED, TOKEN_PRIVILEGES, TOKEN_QUERY};
-use windows_sys::Win32::System::Threading::PROCESS_BASIC_INFORMATION;
+use windows_sys::Win32::System::Threading::{PEB, PROCESS_BASIC_INFORMATION, RTL_USER_PROCESS_PARAMETERS};
 use windows_sys::Win32::System::WindowsProgramming::PUBLIC_OBJECT_BASIC_INFORMATION;
+
+
 
 /// An owned snapshot of PS_PROTECTION's raw byte and decoded protection type, audit flag, and signer category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +25,15 @@ pub struct ProcessProtection
     pub protection_type: u8,
     pub audit: bool,
     pub signer: u8,
+}
+
+
+/// Owned current-directory and full command-line values from the target's process parameters, preserving Windows UTF-16 without lossy conversion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessParameters
+{
+    pub current_directory: PathBuf,
+    pub command_line: OsString,
 }
 
 
@@ -132,6 +147,7 @@ pub fn query_enabled_process_privileges(handle: BorrowedHandle<'_>, print_errors
     {
         let error = io::Error::new(io::ErrorKind::InvalidData, "NtOpenProcessToken reported success without returning a token handle.");
         let _ = error_handle::handle_std_error(&error, "NtOpenProcessToken(TOKEN_QUERY)", print_errors);
+
         return Err(error);
     }
 
@@ -155,6 +171,7 @@ pub fn query_enabled_process_privileges(handle: BorrowedHandle<'_>, print_errors
     {
         let error = io::Error::new(io::ErrorKind::InvalidData, "Token privileges returned a size smaller than their header.");
         let _ = error_handle::handle_std_error(&error, "NtQueryInformationToken(TokenPrivileges)", print_errors);
+
         return Err(error);
     }
 
@@ -194,6 +211,7 @@ pub fn query_enabled_process_privileges(handle: BorrowedHandle<'_>, print_errors
         {
             let error = io::Error::new(io::ErrorKind::InvalidData, "Token privileges reported more bytes than the supplied query buffer.");
             let _ = error_handle::handle_std_error(&error, "NtQueryInformationToken(TokenPrivileges)", print_errors);
+            
             return Err(error);
         }
 
@@ -201,6 +219,169 @@ pub fn query_enabled_process_privileges(handle: BorrowedHandle<'_>, print_errors
     }
 
     Err(error_handle::handle_ntstatus_error(STATUS_BUFFER_TOO_SMALL, "NtQueryInformationToken(TokenPrivileges) after three buffer attempts", print_errors))
+}
+
+
+/// Reads normalized native x64 or WoW64 process parameters from a borrowed handle with query and PROCESS_VM_READ access; returns owned current-directory and full command-line values, optionally reporting failures.
+/// SAFETY: Only bounded native reads access target addresses. Query sizes, pointer arithmetic, parameter lengths, UTF-16 descriptors, and exact transfers are checked. String reads fill byte slices covering initialized u16 buffers exactly; remote pointers are never dereferenced locally.
+pub fn query_process_parameters(handle: BorrowedHandle<'_>, print_errors: bool) -> io::Result<ProcessParameters>
+{
+    let mut wow64_peb = 0_usize;
+    let mut returned_length = 0;
+    let size = size_of::<usize>() as u32;
+
+    let status = unsafe
+    {
+        NtQueryInformationProcess(handle.as_raw_handle(), ProcessWow64Information, (&mut wow64_peb as *mut usize).cast(), size, &mut returned_length)
+    };
+
+    if status < 0
+    {
+        return Err(error_handle::handle_ntstatus_error(status, "NtQueryInformationProcess(ProcessWow64Information)", print_errors));
+    }
+
+    if returned_length != size || wow64_peb > u32::MAX as usize
+    {
+        let error = io::Error::new(io::ErrorKind::InvalidData, "Process WoW64 information has an invalid length or PEB32 address.");
+        let _ = error_handle::handle_std_error(&error, "Querying process parameters", print_errors);
+        return Err(error);
+    }
+
+    let is_wow64 = wow64_peb != 0;
+    let peb_address = if is_wow64
+    {
+        wow64_peb
+    }
+    else
+    {
+        query_process_basic_information(handle, print_errors)?.PebBaseAddress as usize
+    };
+
+    let (pointer_size, parameters_offset, prefix_size, directory_offset, command_line_offset) = if is_wow64
+    {
+        (4, 0x10, 0x48, 0x24, 0x40)
+    }
+    else
+    {
+        (size_of::<usize>(), offset_of!(PEB, ProcessParameters), size_of::<RTL_USER_PROCESS_PARAMETERS>(), 0x38, offset_of!(RTL_USER_PROCESS_PARAMETERS, CommandLine))
+    };
+
+    let Some(parameters_pointer_address) = peb_address.checked_add(parameters_offset).filter(|_| peb_address != 0) else
+    {
+        let error = io::Error::new(io::ErrorKind::InvalidData, "The PEB process-parameters field has a null or overflowing address.");
+        let _ = error_handle::handle_std_error(&error, "Querying process parameters", print_errors);
+
+        return Err(error);
+    };
+
+    let apis = process_apis(print_errors)?;
+
+    let read_bytes = |address: usize, bytes: &mut [u8], context: &str| -> io::Result<()>
+    {
+        if address == 0 || address.checked_add(bytes.len()).filter(|&end| !is_wow64 || end <= u32::MAX as usize + 1).is_none()
+        {
+            let error = io::Error::new(io::ErrorKind::InvalidData, "A process-parameters read has a null, overflowing, or out-of-range address.");
+            let _ = error_handle::handle_std_error(&error, context, print_errors);
+            return Err(error);
+        }
+
+        let mut bytes_read = 0;
+
+        let status = unsafe
+        {
+            (apis.nt_read_virtual_memory)(handle.as_raw_handle(), address as *const c_void, bytes.as_mut_ptr().cast(), bytes.len(), &mut bytes_read)
+        };
+
+        if status < 0
+        {
+            return Err(error_handle::handle_ntstatus_error(status, context, print_errors));
+        }
+
+        if bytes_read != bytes.len()
+        {
+            let error = io::Error::new(io::ErrorKind::UnexpectedEof, format!("The process-parameters read returned {bytes_read} bytes; expected {}.", bytes.len()));
+            let _ = error_handle::handle_std_error(&error, context, print_errors);
+            return Err(error);
+        }
+
+        Ok(())
+    };
+
+    let mut pointer = [0_u8; 8];
+    read_bytes(parameters_pointer_address, &mut pointer[..pointer_size], "NtReadVirtualMemory(PEB ProcessParameters)")?;
+    let parameters_address = u64::from_le_bytes(pointer) as usize;
+    let mut parameters = [0_u8; size_of::<RTL_USER_PROCESS_PARAMETERS>()];
+    read_bytes(parameters_address, &mut parameters[..prefix_size], "NtReadVirtualMemory(process parameters prefix)")?;
+
+    let maximum_length = u32::from_le_bytes([parameters[0], parameters[1], parameters[2], parameters[3]]) as usize;
+    let length = u32::from_le_bytes([parameters[4], parameters[5], parameters[6], parameters[7]]) as usize;
+    let flags = u32::from_le_bytes([parameters[8], parameters[9], parameters[10], parameters[11]]);
+
+    if length < prefix_size || maximum_length < length || flags & 1 == 0
+    {
+        let error = io::Error::new(io::ErrorKind::InvalidData, "Process parameters have an invalid declared size or are not normalized.");
+        let _ = error_handle::handle_std_error(&error, "Querying process parameters", print_errors);
+
+        return Err(error);
+    }
+
+    let mut values = [OsString::new(), OsString::new()];
+
+    for ((offset, context), value) in [(directory_offset, "NtReadVirtualMemory(current directory)"), (command_line_offset, "NtReadVirtualMemory(command line)")].into_iter().zip(values.iter_mut())
+    {
+        let descriptor = &parameters[offset..offset + pointer_size * 2];
+        let byte_length = u16::from_le_bytes([descriptor[0], descriptor[1]]) as usize;
+        let maximum_length = u16::from_le_bytes([descriptor[2], descriptor[3]]) as usize;
+
+        if byte_length > maximum_length || !byte_length.is_multiple_of(size_of::<u16>()) || !maximum_length.is_multiple_of(size_of::<u16>())
+        {
+            let error = io::Error::new(io::ErrorKind::InvalidData, "A process-parameters string has an invalid UTF-16 length.");
+            let _ = error_handle::handle_std_error(&error, context, print_errors);
+            return Err(error);
+        }
+
+        if byte_length == 0
+        {
+            continue;
+        }
+
+        let mut pointer = [0_u8; 8];
+        pointer[..pointer_size].copy_from_slice(&descriptor[pointer_size..pointer_size * 2]);
+        let address = u64::from_le_bytes(pointer) as usize;
+
+        if !address.is_multiple_of(size_of::<u16>())
+        {
+            let error = io::Error::new(io::ErrorKind::InvalidData, "A process-parameters string has an unaligned UTF-16 address.");
+            let _ = error_handle::handle_std_error(&error, context, print_errors);
+            return Err(error);
+        }
+
+        let mut wide = Vec::<u16>::new();
+
+        if let Err(allocation_error) = wide.try_reserve_exact(byte_length / size_of::<u16>())
+        {
+            let error = io::Error::new(io::ErrorKind::OutOfMemory, allocation_error);
+            let _ = error_handle::handle_std_error(&error, context, print_errors);
+            return Err(error);
+        }
+
+        wide.resize(byte_length / size_of::<u16>(), 0);
+        let bytes = unsafe
+        {
+            std::slice::from_raw_parts_mut(wide.as_mut_ptr().cast::<u8>(), byte_length)
+        };
+
+        read_bytes(address, bytes, context)?;
+        *value = OsString::from_wide(&wide);
+    }
+
+    let [current_directory, command_line] = values;
+
+    Ok(ProcessParameters
+    {
+        current_directory: PathBuf::from(current_directory),
+        command_line,
+    })
 }
 
 
@@ -216,6 +397,7 @@ fn parse_enabled_privileges(buffer: &[u32], returned_length: u32, print_errors: 
     {
         let error = io::Error::new(io::ErrorKind::InvalidData, "Token privileges returned an invalid buffer length.");
         let _ = error_handle::handle_std_error(&error, "Reading TokenPrivileges", print_errors);
+
         return Err(error);
     }
 
@@ -225,6 +407,7 @@ fn parse_enabled_privileges(buffer: &[u32], returned_length: u32, print_errors: 
     {
         let error = io::Error::new(io::ErrorKind::InvalidData, "Token privilege count exceeds the returned buffer.");
         let _ = error_handle::handle_std_error(&error, "Reading TokenPrivileges", print_errors);
+
         return Err(error);
     }
 
@@ -243,6 +426,7 @@ fn parse_enabled_privileges(buffer: &[u32], returned_length: u32, print_errors: 
         }
 
         let mut name_length = 0;
+
         let result = unsafe
         {
             LookupPrivilegeNameW(null(), &privilege.Luid, null_mut(), &mut name_length)
@@ -267,6 +451,7 @@ fn parse_enabled_privileges(buffer: &[u32], returned_length: u32, print_errors: 
         {
             let error = io::Error::new(io::ErrorKind::OutOfMemory, reserve_error);
             let _ = error_handle::handle_std_error(&error, "Allocating privilege name buffer", print_errors);
+
             return Err(error);
         }
 
@@ -295,4 +480,3 @@ fn parse_enabled_privileges(buffer: &[u32], returned_length: u32, print_errors: 
 
     Ok(enabled)
 }
-

@@ -1,13 +1,26 @@
 # Process telemetry
 
+See the [Generic README](Generic/README.md) for the folder-specific collection
+API, record fields, handle ownership, access requirements, and usage examples.
+See the [PE README](PE/README.md) for image discovery, header and section queries,
+validation boundaries, signature matching, and usage examples.
+
 [Generic/helpers.rs](Generic/helpers.rs) queries general information about an already-open Windows
 process handle. It supports process inspection by reporting the handle's granted
 access and object counts, the process's basic metadata and PEB address, its
-native protection level, and its enabled primary-token privileges.
+native protection level, enabled primary-token privileges, current working
+directory, and full command line.
+
+[Generic/handle_objects.rs](Generic/handle_objects.rs) separately owns native
+handle snapshots, object-type layouts, and counts grouped by type name.
+
+[Generic/window_objects.rs](Generic/window_objects.rs) enumerates process-owned
+windows on the collector's current desktop and returns a window list, total
+window-handle count, and invisible count.
 
 [Generic/data.rs](Generic/data.rs) is the core collection entry point. It calls
-the helpers, converts their native results into typed Rust storage, and returns
-one owned `ProcessData` record for future use.
+all seven metadata helpers, converts their native results into typed Rust
+storage, and returns one owned `ProcessData` record for future use.
 
 [PE/helpers.rs](PE/helpers.rs) separately obtains the PEB address and mapped
 main executable image base for native x64 or WoW64 targets, checking its MZ/PE
@@ -26,7 +39,8 @@ process/token API exports, currently `NtReadVirtualMemory`.
 
 The helpers accept `BorrowedHandle<'_>` and return snapshots through
 `std::io::Result`. The caller owns the handle and keeps it open during each query.
-The helpers do not close it, open another process, or dereference the target's PEB.
+The helpers do not close it or open another process. Remote addresses are passed
+to native memory reads and are never dereferenced locally.
 The privilege helper opens a separate query-only token handle and closes that
 token automatically before returning.
 Use [../handle.rs](../handle.rs) to acquire an `OwnedHandle` through `NtOpenProcess`.
@@ -40,6 +54,8 @@ test builds through the following declarations in `src/main.rs`:
 - `process_imports` loads `src/ProcessDirectives/imports.rs`.
 - `process_telemetry_tests` loads `Generic/data.rs`.
 - `process_telemetry_tests::helpers` loads `Generic/helpers.rs`.
+- `process_telemetry_tests::handle_objects` loads `Generic/handle_objects.rs`.
+- `process_telemetry_tests::window_objects` loads `Generic/window_objects.rs`.
 - `process_pe_tests` loads `PE/helpers.rs`.
 - `process_pe_tests::signatures` loads `PE/signatures.rs`.
 - `process_pe_tests::sections` loads `PE/sections.rs`.
@@ -52,9 +68,13 @@ module names, so it can be added to `src/main.rs` without changing that runtime 
 Telementry/
   README.md
   Generic/
+    README.md
     data.rs
+    handle_objects.rs
     helpers.rs
+    window_objects.rs
   PE/
+    README.md
     helpers.rs
     signatures.rs
     sections.rs
@@ -64,8 +84,10 @@ Telementry/
 
 `collect_process_data(handle: BorrowedHandle<'_>, print_errors: bool)` returns
 `io::Result<ProcessData>`. It queries object information, process basic information,
-protection information, and enabled privileges, in that order. The first failure
-is returned unchanged, and no partial or default record is returned.
+protection information, enabled privileges, handle-type counts, process
+parameters, and window objects, in that order.
+The first failure is returned unchanged, and no partial or default record is
+returned. Complete collection requires `PROCESS_QUERY_INFORMATION | PROCESS_VM_READ`.
 
 | Record field | Stored type | Contents |
 | --- | --- | --- |
@@ -73,18 +95,24 @@ is returned unchanged, and no partial or default record is returned.
 | `process` | `ProcessBasicData` | `exit_status`, `peb_base_address`, `affinity_mask`, `base_priority`, `process_id`, `parent_process_id` |
 | `protection` | `ProcessProtection` | Raw `level` and decoded `protection_type`, `audit`, `signer` |
 | `enabled_privileges` | `Vec<String>` | Owned names of enabled primary-token privileges |
+| `handle_type_counts` | `BTreeMap<String, usize>` | Counts of process-owned handles keyed by native object-type name |
+| `current_directory` | `PathBuf` | Current working directory from the selected process parameters |
+| `command_line` | `OsString` | Full stored command line, including executable and arguments |
+| `window_objects` | `ProcessWindowData` | Window list with numeric handles, thread IDs, visibility states, total count, and invisible count |
 
 Native process identifiers, affinity, and the numeric PEB address retain their
 native widths as `usize`. Exit status remains `NTSTATUS`, access rights remain
 `PROCESS_ACCESS_RIGHTS`, and object attributes/counts remain `u32`. Reserved object
 values are retained as `[u32; 10]` without interpretation.
 
-`ProcessData` owns all its values, contains no handles or borrowed data, and
+`ProcessData` owns all its values, contains no owned handles or borrowed data, and
 supports `Debug`, `Clone`, `PartialEq`, and `Eq`. It can outlive the source handle,
 be stored in a `Vec<ProcessData>`, or be moved/shared across threads. The process's
 PEB address is stored as a number rather than a raw pointer. Retaining that number
 does not keep the target memory alive or make it safe to dereference locally.
 Collection consists of separate native queries; values can change between queries.
+Window handles are retained only as opaque numeric snapshots, which can become
+invalid or be reused after collection.
 
 ## Available helpers
 
@@ -94,6 +122,9 @@ Collection consists of separate native queries; values can change between querie
 | `query_process_basic_information(handle, print_errors)` | `io::Result<PROCESS_BASIC_INFORMATION>` | `NtQueryInformationProcess` with `ProcessBasicInformation` |
 | `query_process_protection(handle, print_errors)` | `io::Result<ProcessProtection>` | `NtQueryInformationProcess` with `ProcessProtectionInformation` |
 | `query_enabled_process_privileges(handle, print_errors)` | `io::Result<Vec<String>>` | `NtOpenProcessToken(TOKEN_QUERY)` followed by `NtQueryInformationToken(TokenPrivileges)` |
+| `handle_objects::query_process_handle_type_counts(handle, print_errors)` | `io::Result<BTreeMap<String, usize>>` | `NtQueryInformationProcess(ProcessHandleInformation)` followed by `NtQueryObject(ObjectTypesInformation)` |
+| `query_process_parameters(handle, print_errors)` | `io::Result<ProcessParameters>` | Native/WoW64 PEB selection and bounded `NtReadVirtualMemory` reads of current-directory and command-line strings |
+| `window_objects::query_process_windows(handle, print_errors)` | `io::Result<ProcessWindowData>` | Process-ID filtering of top-level, descendant, and message-only HWNDs with visibility queries |
 
 Every `handle` argument is a `BorrowedHandle<'_>`. Import
 `std::os::windows::io::AsHandle` and pass `owned_handle.as_handle()`.
@@ -173,6 +204,62 @@ enabled, it returns `Ok(Vec::new())`. A lookup failure returns `Err` rather than
 an incomplete list. The helper queries existing privilege state without modifying
 it; enabled state is a snapshot taken from the opened token.
 
+### Current directory and command line
+
+`helpers::query_process_parameters` returns owned `current_directory: PathBuf`
+and `command_line: OsString` values, which `collect_process_data` includes directly
+in `ProcessData`. It selects native PEB64 or WoW64 PEB32, validates a bounded
+normalized process-parameters prefix and its UTF-16 descriptors, and reads each
+string through the shared typed native memory API.
+
+The directory is current state at collection time. The command line is the full
+stored text with executable, arguments, and quoting, preserved without a lossy
+UTF-16 conversion or argument splitting. Both values are target-controlled and
+can change between reads. Query access plus `PROCESS_VM_READ` is required.
+See the [Generic parameter guide](Generic/README.md#current-directory-and-command-line)
+for layouts, validation boundaries, and returned types.
+
+### Handle counts by object type
+
+`handle_objects::query_process_handle_type_counts` counts handles owned by the queried process,
+returning an owned `BTreeMap<String, usize>` sorted by native type name, such as
+`File`, `Process`, or `Event`. Each snapshot entry counts once. Zero-count types
+are omitted; an empty snapshot returns an empty map.
+
+It reads a native process-handle snapshot and resolves its type indices through
+the object-type catalog. Returned lengths, entry counts, indices, catalog spans,
+and UTF-16 name pointers are validated. Both native queries allow at most eight
+buffer attempts. Invalid or unresolved data returns `Err` without partial counts.
+This operation requires `PROCESS_QUERY_INFORMATION`, queries no individual target
+handle names, and does not duplicate or close target handles. Counts are separate
+from the process object's `ObjectData::handle_count` reference count.
+`collect_process_data` includes the returned map in `ProcessData::handle_type_counts`.
+
+See the [Generic usage example](Generic/README.md#counts-of-handles-owned-by-the-process).
+
+### Process window objects
+
+`window_objects::query_process_windows` returns `ProcessWindowData` with
+`handle_count: usize`, `invisible_count: usize`, and `windows: Vec<WindowData>`.
+Each entry contains `handle: usize`, `thread_id: u32`, and `is_visible: bool`.
+`collect_process_data` stores this result in `ProcessData::window_objects`.
+
+The list includes desktop-app top-level windows, descendants, and message-only
+windows on the collector thread's current desktop. Every entry is filtered by
+its creator's PID, including children whose parents belong to another process.
+Handles are deduplicated and sorted numerically; `handle_count` equals the list
+length. A successful empty query returns zero counts.
+
+Invisible means `IsWindowVisible` returned false, including a child with a hidden
+ancestor. Minimized, obscured, off-screen, or DWM-cloaked windows can still report
+visible. The query does not inspect other desktops, window stations, or sessions.
+It is a changing snapshot, and retaining the numeric HWND does not retain the
+window. USER window handles are separate from the native kernel handle-type map.
+
+The standalone helper needs process query access and never duplicates handles or
+sends messages to target windows. See the [Generic window guide](Generic/README.md#process-windows-and-visibility)
+for fields, enumeration limits, errors, API references, and an output example.
+
 ## Main executable image address
 
 `query_process_pe_address(handle, print_errors)` in `PE/helpers.rs` returns
@@ -199,7 +286,7 @@ These are numeric remote addresses, not references to memory owned by this
 program. A process can modify its PEB, and its memory can change between reads.
 The generic `ProcessData` collector remains independent of this memory-read helper.
 
-`windows-sys` 0.61.2 has no `NtReadVirtualMemory` binding, so the PE helper obtains
+`windows-sys` 0.61.2 has no `NtReadVirtualMemory` binding, so PE and Generic parameter helpers obtain
 it from `crate::process_imports::process_apis(print_errors)`. That shared module
 resolves the fixed `ntdll` export through `GetProcAddress`, uses a typed x64
 signature with `windows-sys` `HANDLE`/`NTSTATUS`, and pins the loaded module before
@@ -456,7 +543,7 @@ or matcher change is needed. Arrays and borrowed `Vec<u8>` slices both work.
 `process_apis(print_errors)` returns the process-lifetime `ProcessApis` table.
 Its current field, `nt_read_virtual_memory`, is an unsafe function pointer: the
 caller must keep its process handle valid and supply correctly sized writable
-local outputs. `PE/helpers.rs` supplies those arguments for its bounded PEB and
+local outputs. PE and Generic parameter helpers supply those arguments for bounded PEB and
 PE signature reads.
 
 The shared resolver publishes the table once using `OnceLock`; success and the
@@ -475,13 +562,22 @@ requires its own appropriate access rights.
 
 The privilege helper requests only `TOKEN_QUERY` on the token. The native
 `NtOpenProcessToken` documentation specifies `PROCESS_QUERY_INFORMATION` on the
-process handle; the tests also verify `PROCESS_QUERY_LIMITED_INFORMATION` works
-on this Windows system. The example uses `PROCESS_QUERY_INFORMATION` for all four
-queries. Token security restrictions can deny access independently of process access.
+process handle. Complete collection requires `PROCESS_QUERY_INFORMATION` for
+the handle-type snapshot and `PROCESS_VM_READ` for parameter strings, so query-only
+or limited-query-only access is insufficient. The example uses both rights for
+all seven helpers. Token security
+restrictions can deny access independently of process access.
 
 The object basic-information helper queries a valid object's handle and does not
 require process query access. It can therefore inspect the granted access of a
 process handle whose basic-information query would be denied.
+
+Counting handles by object type requires `PROCESS_QUERY_INFORMATION`. It does
+not require process memory-read or handle-duplication access.
+
+Window enumeration requires `PROCESS_QUERY_LIMITED_INFORMATION` or
+`PROCESS_QUERY_INFORMATION` for `GetProcessId`, with no additional memory-read
+or handle-duplication right. Desktop/session visibility limits still apply.
 
 PE image-address discovery requires query access plus `PROCESS_VM_READ`.
 Use `PROCESS_QUERY_INFORMATION | PROCESS_VM_READ`, or limited query access plus
@@ -506,11 +602,11 @@ fn inspect_current_process() -> std::io::Result<()>
     use crate::process_handle_tests::open_process;
     use crate::process_telemetry_tests::{collect_process_data, ProcessData};
     use std::os::windows::io::AsHandle;
-    use windows_sys::Win32::System::Threading::PROCESS_QUERY_INFORMATION;
+    use windows_sys::Win32::System::Threading::{PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
 
     let process_id = std::process::id();
     let print_errors = false;
-    let handle = open_process(process_id, PROCESS_QUERY_INFORMATION, print_errors)?;
+    let handle = open_process(process_id, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, print_errors)?;
 
     let data = collect_process_data(handle.as_handle(), print_errors)?;
     drop(handle);
@@ -520,10 +616,18 @@ fn inspect_current_process() -> std::io::Result<()>
     println!("Granted access=0x{:08X}, object handles={}, kernel references={}", data.object.granted_access, data.object.handle_count, data.object.pointer_count);
     println!("PID={}, parent PID={}, PEB=0x{:X}", data.process.process_id, data.process.parent_process_id, data.process.peb_base_address);
     println!("Protection=0x{:02X}, type={}, audit={}, signer={}", data.protection.level, data.protection.protection_type, data.protection.audit, data.protection.signer);
+    println!("Current directory: {}", data.current_directory.display());
+    println!("Command line: {:?}", data.command_line);
+    println!("Window handles: {}, invisible: {}", data.window_objects.handle_count, data.window_objects.invisible_count);
 
     for privilege in &data.enabled_privileges
     {
         println!("Enabled privilege: {privilege}");
+    }
+
+    for (type_name, count) in &data.handle_type_counts
+    {
+        println!("Handle type {type_name}: {count}");
     }
 
     let records: Vec<ProcessData> = vec![data];
@@ -542,7 +646,9 @@ cargo test inspect_current_process -- --nocapture
 For another process, replace `std::process::id()` with its PID. The `OwnedHandle`
 closes automatically when it goes out of scope; the example closes it explicitly
 before using the record to demonstrate independent ownership. For an individual
-query, import its function from `crate::process_telemetry_tests::helpers` and pass
+query, import its function from `crate::process_telemetry_tests::helpers` (or
+`crate::process_telemetry_tests::handle_objects` for type counts or
+`crate::process_telemetry_tests::window_objects` for windows) and pass
 `handle.as_handle()` while the handle is still open.
 
 ## Usage: inspect the main executable image address
@@ -674,33 +780,37 @@ lookups use the shared Win32 error handlers, retaining their original raw code.
 A process query against an event handle produces an object-type failure; a process handle
 without query access produces an access-denied failure.
 
+Window-query failures retain their Win32 codes. Detected message-window traversal
+cycles return `Interrupted` for the caller to retry; a native enumeration failure
+without an error code returns `Other`. Window-list allocation failures return
+`OutOfMemory`. Callback errors follow the same `print_errors` policy and no
+partial window list is returned on failure.
+
 ## Verification and references
 
-Run the collection tests from the project root:
+Run the telemetry checks from the project root:
 
 ```powershell
-cargo test process_telemetry_tests
-cargo test process_pe_tests
 cargo test process_imports
+cargo check --tests
 ```
 
-They collect all four helper results using full and limited process query access,
-retain owned records after closing their handles, share records across threads,
-check current PID/PEB/status and granted access, and preserve native failures when
-query access is missing. These current-process tests do not require administrator
-permissions.
+The Generic folder currently contains no automated tests. `cargo check --tests`
+checks its compilation. Add the `inspect_current_process` example above to
+exercise complete collection, including the returned handle-type counts, through
+the test runner.
+Current-process inspection with the required query access does not require
+administrator permissions.
 
-The PE helpers are compiled in test builds; their native-query usage can be
-exercised with the `inspect_current_image` example above. It reports the COFF
+The PE folder currently contains no automated tests. The PE helpers and signature
+matcher compile in test builds; their native-query usage can be exercised with the
+`inspect_current_image` example above. It reports the COFF
 fields and optional-header image layout for the current executable.
 The `inspect_current_sections` example lists section metadata and reads a bounded
 prefix from `.text` using the returned remote address.
 
 Import tests invoke the dynamically resolved native memory reader and check a
 missing export's captured Win32 error.
-
-Signature tests cover matches at both boundaries, overlapping candidates,
-empty/truncated data, and literal zero bytes.
 
 Native contracts and layouts:
 

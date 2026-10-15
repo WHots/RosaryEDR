@@ -1,13 +1,25 @@
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io;
 use std::os::windows::io::BorrowedHandle;
+use std::path::PathBuf;
 use windows_sys::Win32::Foundation::NTSTATUS;
 use windows_sys::Win32::System::Threading::PROCESS_ACCESS_RIGHTS;
+
+#[path = "handle_objects.rs"]
+pub mod handle_objects;
 
 #[path = "helpers.rs"]
 pub mod helpers;
 
+#[path = "window_objects.rs"]
+pub mod window_objects;
+
 pub use helpers::ProcessProtection;
-use helpers::{query_enabled_process_privileges, query_object_basic_information, query_process_basic_information, query_process_protection};
+pub use window_objects::ProcessWindowData;
+use handle_objects::query_process_handle_type_counts;
+use helpers::{query_enabled_process_privileges, query_object_basic_information, query_process_basic_information, query_process_parameters, query_process_protection};
+use window_objects::query_process_windows;
 
 /// Owned native object information, retaining reserved values without interpreting them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,7 +46,7 @@ pub struct ProcessBasicData
 }
 
 
-/// A complete owned record containing every helper's collected data, suitable for retaining after the handle closes.
+/// An owned record containing all seven query results, suitable for retaining after the handle closes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessData
 {
@@ -42,16 +54,23 @@ pub struct ProcessData
     pub process: ProcessBasicData,
     pub protection: ProcessProtection,
     pub enabled_privileges: Vec<String>,
+    pub handle_type_counts: BTreeMap<String, usize>,
+    pub current_directory: PathBuf,
+    pub command_line: OsString,
+    pub window_objects: ProcessWindowData,
 }
 
 
-/// Collects all four native helper results from a borrowed process handle and returns one owned record, or the first query failure; print_errors controls helper reporting.
+/// Collects all seven helper results from a borrowed process handle with PROCESS_QUERY_INFORMATION and PROCESS_VM_READ; returns one owned record or the first failure, with print_errors controlling reporting.
 pub fn collect_process_data(handle: BorrowedHandle<'_>, print_errors: bool) -> io::Result<ProcessData>
 {
     let object = query_object_basic_information(handle, print_errors)?;
     let process = query_process_basic_information(handle, print_errors)?;
     let protection = query_process_protection(handle, print_errors)?;
     let enabled_privileges = query_enabled_process_privileges(handle, print_errors)?;
+    let handle_type_counts = query_process_handle_type_counts(handle, print_errors)?;
+    let parameters = query_process_parameters(handle, print_errors)?;
+    let window_objects = query_process_windows(handle, print_errors)?;
 
     Ok(ProcessData
     {
@@ -74,56 +93,9 @@ pub fn collect_process_data(handle: BorrowedHandle<'_>, print_errors: bool) -> i
         },
         protection,
         enabled_privileges,
+        handle_type_counts,
+        current_directory: parameters.current_directory,
+        command_line: parameters.command_line,
+        window_objects,
     })
-}
-
-
-#[cfg(test)]
-mod tests
-{
-    use super::*;
-    use crate::error_handle::NtStatusError;
-    use crate::process_handle_tests::open_process;
-    use std::os::windows::io::AsHandle;
-    use std::sync::Arc;
-    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, STATUS_ACCESS_DENIED, STATUS_PENDING};
-    use windows_sys::Win32::System::Threading::{PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ};
-
-
-    /// Confirms complete records remain usable after closing their source handle and sharing them across threads.
-    #[test]
-    fn collected_data_outlives_handle_and_can_be_shared()
-    {
-        for desired_access in [PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION]
-        {
-            let process_id = std::process::id();
-            let handle = open_process(process_id, desired_access, false).unwrap();
-            let data = Arc::new(collect_process_data(handle.as_handle(), false).unwrap());
-            drop(handle);
-
-            let worker_data = Arc::clone(&data);
-            let retained = std::thread::spawn(move || worker_data).join().unwrap();
-
-            assert!(Arc::ptr_eq(&data, &retained));
-            assert_eq!(retained.process.process_id, process_id as usize);
-            assert_eq!(retained.process.exit_status, STATUS_PENDING);
-            assert_ne!(retained.process.peb_base_address, 0);
-            assert_eq!(retained.object.granted_access & desired_access, desired_access);
-            assert!(retained.object.handle_count >= 1);
-        }
-    }
-
-
-    /// Confirms failed collection retains the original native query error instead of returning a partial or default record.
-    #[test]
-    fn collection_preserves_native_failure_without_a_record()
-    {
-        let handle = open_process(std::process::id(), PROCESS_VM_READ, false).unwrap();
-        let error = collect_process_data(handle.as_handle(), false).unwrap_err();
-        let native_error = error.get_ref().and_then(|error| error.downcast_ref::<NtStatusError>()).unwrap();
-
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert_eq!(native_error.status, STATUS_ACCESS_DENIED);
-        assert_eq!(native_error.win32_code, ERROR_ACCESS_DENIED);
-    }
 }

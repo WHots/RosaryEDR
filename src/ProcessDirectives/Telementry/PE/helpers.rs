@@ -91,10 +91,12 @@ pub fn query_process_pe_address(handle: BorrowedHandle<'_>, print_errors: bool) 
     {
         let error = io::Error::new(io::ErrorKind::InvalidData, "The process query returned a null PEB address.");
         let _ = error_handle::handle_std_error(&error, "Querying process PE address", print_errors);
+        
         return Err(error);
     }
 
     let image_base_address = read_image_base_address(handle, peb_base_address, is_wow64, print_errors)?;
+
     validate_process_pe_image(handle, image_base_address, print_errors)?;
 
     Ok(ProcessPeAddress
@@ -276,6 +278,7 @@ fn read_image_file_header(handle: BorrowedHandle<'_>, nt_headers_address: usize,
     };
 
     let mut bytes = [0_u8; size_of::<IMAGE_FILE_HEADER>()];
+    
     read_process_bytes(handle, file_header_address, &mut bytes, "NtReadVirtualMemory(IMAGE_FILE_HEADER)", print_errors)?;
 
     let header = unsafe

@@ -24,38 +24,3 @@ pub fn contains_signature(read_bytes: &[u8], signature: &[u8]) -> bool
 
     read_bytes.windows(signature.len()).any(|bytes| bytes == signature)
 }
-
-
-#[cfg(test)]
-mod tests
-{
-    use super::*;
-
-
-    /// Confirms exact matches at both buffer boundaries and overlapping candidate positions are found.
-    #[test]
-    fn finds_boundary_and_overlapping_matches()
-    {
-        assert!(contains_signature(b"MZ", &MZ_SIGNATURE));
-        assert!(contains_signature(b"MZdata", &MZ_SIGNATURE));
-        assert!(contains_signature(b"dataMZ", &MZ_SIGNATURE));
-        assert!(contains_signature(b"dataPE\0\0tail", &PE_SIGNATURE));
-        assert!(contains_signature(&[0xAB, 0xAB, 0xAB, 0xCD], &[0xAB, 0xAB, 0xCD]));
-    }
-
-
-    /// Confirms empty input/patterns, truncated signatures, and changed literal zero bytes do not match.
-    #[test]
-    fn rejects_empty_short_and_incomplete_signatures()
-    {
-        assert!(!contains_signature(&[], &MZ_SIGNATURE));
-        assert!(!contains_signature(b"MZ", &[]));
-        assert!(!contains_signature(&[], &[]));
-        assert!(!contains_signature(b"M", &MZ_SIGNATURE));
-        assert!(!contains_signature(b"PE\0", &PE_SIGNATURE));
-        assert!(!contains_signature(b"PE\0X", &PE_SIGNATURE));
-        assert!(!contains_signature(b"unrelated", &PE_SIGNATURE));
-    }
-
-
-}

@@ -16,6 +16,7 @@ mod process_imports;
 mod process_handle_tests;
 
 #[cfg(test)]
+#[allow(dead_code, reason = "Generic telemetry helpers are compiled for validation but are intentionally not wired into the ETW flow.")]
 #[path = "ProcessDirectives/Telementry/Generic/data.rs"]
 mod process_telemetry_tests;
 
@@ -25,7 +26,7 @@ mod process_telemetry_tests;
 mod process_pe_tests;
 
 
-/// Runs the process-start monitor; takes no arguments and returns an exit code.
+
 fn main() -> ExitCode
 {
     match etw::monitor_process_starts(true)
